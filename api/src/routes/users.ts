@@ -27,23 +27,29 @@ async function fetchErpUsers(token: string): Promise<any[]> {
   try {
     const res = await axios.post(
       `${ERP_API_URL}/UserMng/searchUserAjax`,
-      {},
+      { useYn: "Y" },
       {
         headers: {
           "Content-Type": "application/json",
-          "access": `Bearer ${token}`,
+          "Authorization": `Bearer ${token}`,
         },
         timeout: 5000,
       }
     );
 
     const data = res.data;
-    const list = data.resultList ?? data.list ?? [];
+    const rawList = data.resultList ?? data.list ?? [];
+
+    // USE_YN = 'Y'인 사용자만 필터 (퇴사자 제외)
+    const list = rawList.filter((u: any) => {
+      const useYn = u.useYn ?? u.USE_YN ?? "Y";
+      return useYn === "Y";
+    });
 
     if (list.length > 0) {
       userCache = list;
       userCacheTime = Date.now();
-      console.log(`[users] ERP users cached: ${list.length}명`);
+      console.log(`[users] ERP users cached: ${list.length}명 (USE_YN=Y only)`);
       return list;
     }
   } catch (err: any) {

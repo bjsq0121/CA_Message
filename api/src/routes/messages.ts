@@ -50,7 +50,22 @@ router.get("/:roomId", async (req: AuthRequest, res) => {
     `UPDATE chat_member SET last_read_at = datetime('now', 'localtime') WHERE room_id = ? AND user_id = ?`
   ).run(roomId, req.userId);
 
-  res.json({ messages: rows.reverse(), hasMore });
+  // 각 메시지별 안읽은 인원 수 계산
+  const totalMembers = (db.prepare(
+    `SELECT COUNT(*) as cnt FROM chat_member WHERE room_id = ?`
+  ).get(roomId) as any).cnt;
+
+  const readCounts = db.prepare(
+    `SELECT COUNT(*) as cnt FROM chat_member
+     WHERE room_id = ? AND last_read_at >= ?`
+  );
+
+  const messagesWithRead = rows.reverse().map((msg: any) => {
+    const readCnt = (readCounts.get(roomId, msg.createdAt) as any).cnt;
+    return { ...msg, unreadCount: Math.max(0, totalMembers - readCnt) };
+  });
+
+  res.json({ messages: messagesWithRead, hasMore, totalMembers });
 });
 
 // 메시지 저장
@@ -75,6 +90,33 @@ router.post("/:roomId", async (req: AuthRequest, res) => {
   ).run(req.params.roomId);
 
   res.status(201).json({ msgId });
+});
+
+// 읽음 처리 (클라이언트에서 방 진입 시 호출)
+router.post("/:roomId/read", async (req: AuthRequest, res) => {
+  const db = getDb();
+  db.prepare(
+    `UPDATE chat_member SET last_read_at = datetime('now', 'localtime') WHERE room_id = ? AND user_id = ?`
+  ).run(req.params.roomId, req.userId);
+  res.json({ ok: true });
+});
+
+// 메시지 1건 삭제 (본인 메시지만)
+router.delete("/:roomId/:msgId", async (req: AuthRequest, res) => {
+  const db = getDb();
+  db.prepare(
+    `DELETE FROM chat_msg WHERE msg_id = ? AND room_id = ? AND user_id = ?`
+  ).run(req.params.msgId, req.params.roomId, req.userId);
+  res.json({ ok: true });
+});
+
+// 대화 전체 지우기 (해당 방의 내 메시지 전부 삭제)
+router.delete("/:roomId", async (req: AuthRequest, res) => {
+  const db = getDb();
+  db.prepare(
+    `DELETE FROM chat_msg WHERE room_id = ? AND user_id = ?`
+  ).run(req.params.roomId, req.userId);
+  res.json({ ok: true });
 });
 
 export { router as messageRoutes };

@@ -14,6 +14,7 @@ export interface ChatMessage {
   fileName?: string;
   fileUrl?: string;
   createdAt: string;
+  unreadCount?: number;
 }
 
 export interface ChatRoom {
@@ -38,7 +39,7 @@ const currentUserNm = ref("");
 const connected = ref(false);
 const token = ref("");
 
-// 방별 메시지 저장소 (메모리)
+// 방별 메시지 저장소
 const roomMessages: Record<string, ChatMessage[]> = {};
 
 // 방별 안읽은 수
@@ -47,7 +48,21 @@ const unreadCounts = reactive<Record<string, number>>({});
 // 현재 활성 방 ID
 let activeRoomId = "";
 
-// 알림 권한 요청
+// 중복 방지: content+userId+시간(초) 기반 키
+function msgKey(m: { userId: string; content: string; createdAt: string }): string {
+  return `${m.userId}|${m.content}|${m.createdAt.substring(0, 19)}`;
+}
+
+function addMessageIfNew(roomId: string, msg: ChatMessage): boolean {
+  if (!roomMessages[roomId]) roomMessages[roomId] = [];
+  const msgs = roomMessages[roomId];
+  const key = msgKey(msg);
+  if (msgs.find((m) => m.msgId === msg.msgId || msgKey(m) === key)) return false;
+  msgs.push(msg);
+  return true;
+}
+
+// 알림
 function requestNotifPermission() {
   if ("Notification" in window && Notification.permission === "default") {
     Notification.requestPermission();
@@ -60,22 +75,44 @@ function showBrowserNotification(title: string, body: string) {
   }
 }
 
-// 알림음 (사용자 인터랙션 후에만 재생 가능)
 let notifAudioCtx: AudioContext | null = null;
+let audioUnlocked = false;
+
+// 사용자 첫 인터랙션 시 AudioContext 잠금 해제
+function unlockAudio() {
+  if (audioUnlocked) return;
+  try {
+    notifAudioCtx = new AudioContext();
+    if (notifAudioCtx.state === "suspended") notifAudioCtx.resume();
+    audioUnlocked = true;
+  } catch {}
+}
+
+// 페이지 어디든 클릭/키보드 시 한 번만 잠금 해제
+if (typeof window !== "undefined") {
+  const unlock = () => { unlockAudio(); window.removeEventListener("click", unlock); window.removeEventListener("keydown", unlock); };
+  window.addEventListener("click", unlock, { once: true });
+  window.addEventListener("keydown", unlock, { once: true });
+}
 
 function playNotifSound() {
   try {
-    if (!notifAudioCtx) notifAudioCtx = new AudioContext();
+    if (!notifAudioCtx) { unlockAudio(); }
+    if (!notifAudioCtx) return;
+    if (notifAudioCtx.state === "suspended") notifAudioCtx.resume();
     const osc = notifAudioCtx.createOscillator();
     const gain = notifAudioCtx.createGain();
     osc.connect(gain);
     gain.connect(notifAudioCtx.destination);
     osc.frequency.value = 800;
-    gain.gain.value = 0.1;
+    gain.gain.value = 0.15;
     osc.start();
     osc.stop(notifAudioCtx.currentTime + 0.15);
   } catch {}
 }
+
+// 구독 중복 방지
+const subscribedRoomIds = new Set<string>();
 
 export function useChat() {
   function getToken() {
@@ -120,25 +157,26 @@ export function useChat() {
     });
   }
 
-  // 유저별 알림 채널 구독 (초대/방 변경 알림)
   function subscribeUserChannel(onRoomUpdate: () => void) {
     if (!realtimeClient.value) return;
     const channel = realtimeClient.value.channels.get(`user:${currentUserId.value}`);
-    channel.subscribe("room_invite", () => {
-      onRoomUpdate();
-    });
-    channel.subscribe("room_update", () => {
-      onRoomUpdate();
-    });
+    channel.subscribe("room_invite", () => onRoomUpdate());
+    channel.subscribe("room_update", () => onRoomUpdate());
   }
 
-  // 초대 알림 발송 (초대한 사용자들에게)
   function notifyInvite(userIds: string[], roomName: string) {
     if (!realtimeClient.value) return;
     for (const uid of userIds) {
       const channel = realtimeClient.value.channels.get(`user:${uid}`);
       channel.publish("room_invite", { roomName, invitedBy: currentUserNm.value });
     }
+  }
+
+  // 읽음 상태 변경을 방에 알림
+  function notifyRead(roomId: string) {
+    if (!realtimeClient.value) return;
+    const channel = realtimeClient.value.channels.get(`chat:${roomId}`);
+    channel.publish("read", { userId: currentUserId.value, at: new Date().toISOString() });
   }
 
   async function getRooms(): Promise<ChatRoom[]> {
@@ -160,15 +198,13 @@ export function useChat() {
     try {
       const res = await axios.get(`${API_BASE}/users/organization`, { headers: headers() });
       return res.data;
-    } catch {
-      return [];
-    }
+    } catch { return []; }
   }
 
   function parseAblyMsg(roomId: string, ablyMsg: Ably.Message): ChatMessage {
     const data = ablyMsg.data as any;
     return {
-      msgId: ablyMsg.id ?? `${Date.now()}-${Math.random()}`,
+      msgId: ablyMsg.id ?? `ably-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       roomId,
       userId: ablyMsg.clientId ?? data.userId ?? "",
       userNm: data.userNm ?? ablyMsg.clientId ?? "",
@@ -180,36 +216,39 @@ export function useChat() {
     };
   }
 
-  // 모든 방 백그라운드 구독 — 메시지 저장 + 안읽음 카운트
+  // 모든 방 구독 — 실시간 메시지 수신 + 안읽음 + 읽음 알림
   function subscribeAllRooms(
     rooms: ChatRoom[],
-    onUpdate: (roomId: string, msg: ChatMessage) => void,
+    onNewMessage: (roomId: string, msg: ChatMessage) => void,
+    onReadUpdate?: (roomId: string) => void,
   ) {
     if (!realtimeClient.value) return;
 
     for (const room of rooms) {
+      // 이미 구독한 방은 건너뛰기
+      if (subscribedRoomIds.has(room.ROOM_ID)) continue;
+      subscribedRoomIds.add(room.ROOM_ID);
+
       if (!roomMessages[room.ROOM_ID]) roomMessages[room.ROOM_ID] = [];
 
       const channel = realtimeClient.value.channels.get(`chat:${room.ROOM_ID}`);
+
       channel.subscribe("message", (ablyMsg) => {
         const msg = parseAblyMsg(room.ROOM_ID, ablyMsg);
+        if (!addMessageIfNew(room.ROOM_ID, msg)) return;
 
-        // 중복 방지
-        const msgs = roomMessages[room.ROOM_ID];
-        if (msgs.find((m) => m.msgId === msg.msgId)) return;
-        msgs.push(msg);
-
-        // 안읽음 카운트 (현재 보고 있는 방이 아닌 경우)
         if (activeRoomId !== room.ROOM_ID && msg.userId !== currentUserId.value) {
           unreadCounts[room.ROOM_ID] = (unreadCounts[room.ROOM_ID] ?? 0) + 1;
           playNotifSound();
-          showBrowserNotification(
-            room.ROOM_NM,
-            `${msg.userNm}: ${msg.content}`,
-          );
+          showBrowserNotification(room.ROOM_NM, `${msg.userNm}: ${msg.content}`);
         }
 
-        onUpdate(room.ROOM_ID, msg);
+        onNewMessage(room.ROOM_ID, msg);
+      });
+
+      // 읽음 이벤트 수신 → unreadCount 갱신
+      channel.subscribe("read", () => {
+        if (onReadUpdate) onReadUpdate(room.ROOM_ID);
       });
     }
   }
@@ -229,7 +268,6 @@ export function useChat() {
     onPresence?: (presentUsers: string[]) => void,
   ) {
     if (!realtimeClient.value) return () => {};
-
     const channel = realtimeClient.value.channels.get(`chat:${roomId}`);
 
     if (onTyping) {
@@ -239,27 +277,20 @@ export function useChat() {
         if (!uid || uid === currentUserId.value) return;
         typingSet.add(uid);
         onTyping([...typingSet]);
-        setTimeout(() => {
-          typingSet.delete(uid);
-          onTyping([...typingSet]);
-        }, 3000);
+        setTimeout(() => { typingSet.delete(uid); onTyping([...typingSet]); }, 3000);
       });
     }
 
     if (onPresence) {
       channel.presence.subscribe(() => {
         channel.presence.get((err, members) => {
-          if (!err && members) {
-            onPresence(members.map((m) => m.clientId));
-          }
+          if (!err && members) onPresence(members.map((m) => m.clientId));
         });
       });
       channel.presence.enter({ userNm: currentUserNm.value });
     }
 
-    return () => {
-      channel.presence.leave();
-    };
+    return () => { channel.presence.leave(); };
   }
 
   async function loadHistory(roomId: string, before?: string): Promise<{ messages: ChatMessage[]; hasMore: boolean }> {
@@ -269,24 +300,41 @@ export function useChat() {
       const res = await axios.get(`${API_BASE}/messages/${roomId}`, { headers: headers(), params });
       const data = res.data;
 
-      // 히스토리를 메모리에 병합
-      const existing = roomMessages[roomId] ?? [];
-      for (const msg of data.messages) {
-        if (!existing.find((m: ChatMessage) => m.msgId === msg.msgId)) {
-          existing.push(msg);
-        }
-      }
-      existing.sort((a: ChatMessage, b: ChatMessage) => a.createdAt.localeCompare(b.createdAt));
-      roomMessages[roomId] = existing;
+      // DB를 정본으로 — 메모리 초기화 후 DB 데이터 로드
+      roomMessages[roomId] = data.messages;
 
-      return data;
+      return { messages: data.messages, hasMore: data.hasMore };
     } catch {
       return { messages: roomMessages[roomId] ?? [], hasMore: false };
     }
   }
 
+  async function markRead(roomId: string) {
+    try {
+      await axios.post(`${API_BASE}/messages/${roomId}/read`, {}, { headers: headers() });
+      notifyRead(roomId);
+    } catch {}
+  }
+
+  async function refreshUnreadCounts(roomId: string): Promise<ChatMessage[]> {
+    try {
+      const res = await axios.get(`${API_BASE}/messages/${roomId}`, { headers: headers(), params: { limit: 50 } });
+      roomMessages[roomId] = res.data.messages;
+      return res.data.messages;
+    } catch {
+      return roomMessages[roomId] ?? [];
+    }
+  }
+
   function sendMessage(roomId: string, content: string, msgType = "TEXT", fileName?: string, fileUrl?: string) {
     if (!realtimeClient.value) return;
+
+    // 1. API에 저장 먼저 (DB가 정본)
+    axios.post(`${API_BASE}/messages/${roomId}`, {
+      content, msgType, userNm: currentUserNm.value, fileName, fileUrl,
+    }, { headers: headers() }).catch(() => {});
+
+    // 2. Ably로 실시간 전달
     const channel = realtimeClient.value.channels.get(`chat:${roomId}`);
     channel.publish("message", {
       userId: currentUserId.value,
@@ -296,11 +344,6 @@ export function useChat() {
       fileName,
       fileUrl,
     });
-
-    // API에 저장 (비동기, 실패해도 무시)
-    axios.post(`${API_BASE}/messages/${roomId}`, {
-      content, msgType, userNm: currentUserNm.value, fileName, fileUrl,
-    }, { headers: headers() }).catch(() => {});
   }
 
   function sendTyping(roomId: string) {
@@ -334,6 +377,8 @@ export function useChat() {
     getMessagesForRoom,
     setActiveRoom,
     loadHistory,
+    markRead,
+    refreshUnreadCounts,
     sendMessage,
     sendTyping,
     disconnect,

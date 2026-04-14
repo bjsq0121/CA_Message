@@ -50,6 +50,7 @@
           <button @click="showSearch = !showSearch" class="header-btn">&#128269;</button>
           <button @click="showMembers = !showMembers" class="header-btn">&#128101; {{ activeRoom.MEMBER_COUNT }}</button>
           <button @click="openInvite" class="header-btn">+ 초대</button>
+          <button @click="closeChat" class="header-btn" style="color:#e74c3c">&#10005;</button>
         </div>
 
         <!-- 검색바 -->
@@ -88,6 +89,7 @@
               class="msg-bubble"
               :class="[msg.userId === currentUserId ? 'msg-mine' : 'msg-other', { 'msg-highlight': msgSearchResults.includes(i) }]"
               :ref="(el) => { if (msgSearchResults[msgSearchIdx] === i) searchTargetEl = el as HTMLElement; }"
+              @contextmenu.prevent="onMsgContext($event, msg)"
             >
               <!-- 이미지 -->
               <template v-if="msg.msgType === 'IMAGE'">
@@ -102,8 +104,9 @@
               <!-- 텍스트 -->
               <template v-else>{{ msg.content }}</template>
             </div>
-            <div class="msg-time" :style="{ textAlign: msg.userId === currentUserId ? 'right' : 'left' }">
-              {{ formatTime(msg.createdAt) }}
+            <div class="msg-meta" :style="{ textAlign: msg.userId === currentUserId ? 'right' : 'left' }">
+              <span v-if="msg.unreadCount" class="msg-unread">{{ msg.unreadCount }}</span>
+              <span class="msg-time-text">{{ formatTime(msg.createdAt) }}</span>
             </div>
           </template>
         </div>
@@ -210,9 +213,16 @@
       </div>
     </div>
 
-    <!-- 우클릭 컨텍스트 메뉴 -->
-    <div v-if="contextMenu.show" class="context-menu" :style="{ top: contextMenu.y + 'px', left: contextMenu.x + 'px' }" @mouseleave="contextMenu.show = false">
-      <div class="context-item" @click="leaveRoom">나가기</div>
+    <!-- 채팅방 우클릭 컨텍스트 메뉴 -->
+    <div v-if="contextMenu.show" class="context-menu" :style="{ top: contextMenu.y + 'px', left: contextMenu.x + 'px' }">
+      <div class="context-item" @click="clearRoomMessages">대화 지우기</div>
+      <div class="context-item" style="color:#e74c3c" @click="leaveRoom">나가기</div>
+    </div>
+
+    <!-- 메시지 우클릭 컨텍스트 메뉴 -->
+    <div v-if="msgContextMenu.show" class="context-menu" :style="{ top: msgContextMenu.y + 'px', left: msgContextMenu.x + 'px' }">
+      <div class="context-item" @click="copyMessage">복사</div>
+      <div v-if="msgContextMenu.msg?.userId === currentUserId" class="context-item" style="color:#e74c3c" @click="deleteMessage">삭제</div>
     </div>
 
     <!-- 이미지 뷰어 -->
@@ -247,6 +257,8 @@ const {
   getMessagesForRoom,
   setActiveRoom,
   loadHistory,
+  markRead,
+  refreshUnreadCounts,
   sendMessage,
   sendTyping,
   disconnect,
@@ -284,8 +296,11 @@ const msgSearchResults = ref<number[]>([]);
 const msgSearchIdx = ref(0);
 const searchTargetEl = ref<HTMLElement | null>(null);
 
-// 컨텍스트 메뉴
+// 채팅방 컨텍스트 메뉴
 const contextMenu = reactive({ show: false, x: 0, y: 0, room: null as ChatRoom | null });
+
+// 메시지 컨텍스트 메뉴
+const msgContextMenu = reactive({ show: false, x: 0, y: 0, msg: null as ChatMessage | null });
 
 // 이미지 뷰어
 const viewImageUrl = ref("");
@@ -409,6 +424,63 @@ async function leaveRoom() {
   await loadRooms();
 }
 
+// 대화 지우기 (내 화면에서만 삭제)
+async function clearRoomMessages() {
+  const room = contextMenu.room;
+  contextMenu.show = false;
+  if (!room) return;
+  const t = localStorage.getItem("ca_token") ?? "";
+  try {
+    await axios.delete(
+      `${API_BASE}/messages/${room.ROOM_ID}`,
+      { headers: { Authorization: `Bearer ${t}` } }
+    );
+  } catch {}
+  // 메모리에서도 제거
+  if (activeRoom.value?.ROOM_ID === room.ROOM_ID) {
+    messages.value = [];
+  }
+  const r = rooms.value.find((r) => r.ROOM_ID === room.ROOM_ID);
+  if (r) r.LAST_MSG = "";
+}
+
+// 채팅창 닫기 (방 나가기X, 대화 영역만 닫기)
+function closeChat() {
+  activeRoom.value = null;
+  setActiveRoom(""); // 활성 방 초기화 → 알림 받을 수 있도록
+}
+
+// 메시지 우클릭
+function onMsgContext(e: MouseEvent, msg: ChatMessage) {
+  msgContextMenu.show = true;
+  msgContextMenu.x = e.clientX;
+  msgContextMenu.y = e.clientY;
+  msgContextMenu.msg = msg;
+}
+
+// 메시지 복사
+function copyMessage() {
+  if (msgContextMenu.msg) {
+    navigator.clipboard.writeText(msgContextMenu.msg.content).catch(() => {});
+  }
+  msgContextMenu.show = false;
+}
+
+// 메시지 삭제 (내 메시지만)
+async function deleteMessage() {
+  const msg = msgContextMenu.msg;
+  msgContextMenu.show = false;
+  if (!msg || msg.userId !== currentUserId.value) return;
+  const t = localStorage.getItem("ca_token") ?? "";
+  try {
+    await axios.delete(
+      `${API_BASE}/messages/${msg.roomId}/${msg.msgId}`,
+      { headers: { Authorization: `Bearer ${t}` } }
+    );
+  } catch {}
+  messages.value = messages.value.filter((m) => m.msgId !== msg.msgId);
+}
+
 // 방 선택
 async function selectRoom(room: ChatRoom) {
   if (unsubscribeRoom) unsubscribeRoom();
@@ -421,7 +493,8 @@ async function selectRoom(room: ChatRoom) {
   // 활성 방 설정 + 안읽음 초기화
   setActiveRoom(room.ROOM_ID);
 
-  // DB에서 히스토리 로드 + 메모리 병합
+  // 읽음 처리 + 히스토리 로드
+  await markRead(room.ROOM_ID);
   await loadHistory(room.ROOM_ID);
   messages.value = getMessagesForRoom(room.ROOM_ID);
 
@@ -447,6 +520,7 @@ function send() {
   if (!text || !activeRoom.value) return;
   inputText.value = "";
   sendMessage(activeRoom.value.ROOM_ID, text);
+  nextTick(scrollToBottom);
 }
 
 function onTyping() {
@@ -508,7 +582,20 @@ function scrollToSearchResult() {
 }
 
 function scrollToBottom() {
-  if (messagesEl.value) messagesEl.value.scrollTop = messagesEl.value.scrollHeight;
+  if (messagesEl.value) {
+    messagesEl.value.scrollTo({ top: messagesEl.value.scrollHeight, behavior: "smooth" });
+  }
+}
+
+// 새 메시지 올 때 자동 스크롤 (스크롤이 맨 아래 근처일 때만)
+function isNearBottom(): boolean {
+  if (!messagesEl.value) return true;
+  const { scrollTop, scrollHeight, clientHeight } = messagesEl.value;
+  return scrollHeight - scrollTop - clientHeight < 100;
+}
+
+function autoScroll() {
+  if (isNearBottom()) nextTick(scrollToBottom);
 }
 
 function logout() {
@@ -520,7 +607,7 @@ function logout() {
 
 onMounted(async () => {
   window.addEventListener("resize", () => { isMobile.value = window.innerWidth <= 768; });
-  window.addEventListener("click", () => { contextMenu.show = false; });
+  window.addEventListener("click", () => { contextMenu.show = false; msgContextMenu.show = false; });
   const t = localStorage.getItem("ca_token");
   if (!t) { router.push("/login"); return; }
 
@@ -535,24 +622,36 @@ onMounted(async () => {
     subscribeAllRooms(rooms.value, (roomId, msg) => {
       if (activeRoom.value?.ROOM_ID === roomId) {
         messages.value = getMessagesForRoom(roomId);
-        nextTick(scrollToBottom);
+        autoScroll();
       }
       const r = rooms.value.find((r) => r.ROOM_ID === roomId);
       if (r) r.LAST_MSG = msg.content;
+    }, async (roomId) => {
+      if (activeRoom.value?.ROOM_ID === roomId) {
+        messages.value = await refreshUnreadCounts(roomId);
+      }
     });
   });
 
-  // 백그라운드 메시지 수신 + 안읽음 추적
-  subscribeAllRooms(rooms.value, (roomId, msg) => {
-    // 현재 보고 있는 방이면 UI 업데이트
-    if (activeRoom.value?.ROOM_ID === roomId) {
-      messages.value = getMessagesForRoom(roomId);
-      nextTick(scrollToBottom);
-    }
-    // 사이드바 마지막 메시지 업데이트
-    const r = rooms.value.find((r) => r.ROOM_ID === roomId);
-    if (r) r.LAST_MSG = msg.content;
-  });
+  // 백그라운드 메시지 수신 + 안읽음 추적 + 읽음 실시간 갱신
+  subscribeAllRooms(
+    rooms.value,
+    // 새 메시지 수신
+    (roomId, msg) => {
+      if (activeRoom.value?.ROOM_ID === roomId) {
+        messages.value = getMessagesForRoom(roomId);
+        autoScroll();
+      }
+      const r = rooms.value.find((r) => r.ROOM_ID === roomId);
+      if (r) r.LAST_MSG = msg.content;
+    },
+    // 읽음 이벤트 수신 → 현재 보고 있는 방이면 unreadCount 새로고침
+    async (roomId) => {
+      if (activeRoom.value?.ROOM_ID === roomId) {
+        messages.value = await refreshUnreadCounts(roomId);
+      }
+    },
+  );
 });
 
 onUnmounted(() => {
@@ -561,6 +660,25 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+.msg-meta {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: #999;
+  margin-top: 2px;
+  padding: 0 4px;
+}
+.msg-meta[style*="right"] { justify-content: flex-end; }
+.msg-unread {
+  color: #4A90D9;
+  font-weight: 700;
+  font-size: 11px;
+}
+.msg-time-text {
+  color: #999;
+}
+
 .header-btn {
   background: none;
   border: 1px solid #ddd;

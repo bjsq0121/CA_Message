@@ -1,12 +1,12 @@
 import Database from "better-sqlite3";
 import path from "node:path";
+import fs from "node:fs";
 
 const DB_PATH = path.resolve("data", "messenger.db");
 
 let db: Database.Database | null = null;
 
 export function initSqlite() {
-  const fs = require("node:fs");
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 
   db = new Database(DB_PATH);

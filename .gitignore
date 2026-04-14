@@ -1,0 +1,23 @@
+node_modules/
+dist/
+data/
+uploads/
+
+# 환경변수 (DB, API 키)
+.env
+api/.env
+ui/.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 빌드 캐시
+*.tsbuildinfo
+.vite/
