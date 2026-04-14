@@ -2,7 +2,8 @@ import { ref, shallowRef, reactive } from "vue";
 import * as Ably from "ably";
 import axios from "axios";
 
-const API_BASE = window.location.port === "3000" ? "http://localhost:3200" : "/api";
+const isElectron = window.location.protocol === "file:" || !!(window as any).electronAPI;
+const API_BASE = isElectron || window.location.port === "3000" ? "http://localhost:3200" : "/api";
 
 export interface ChatMessage {
   msgId: string;

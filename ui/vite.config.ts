@@ -4,6 +4,7 @@ import path from "path";
 
 export default defineConfig({
   plugins: [vue()],
+  base: "./", // Electron 파일 프로토콜 호환
   resolve: {
     alias: { "@": path.resolve(__dirname, "src") },
   },

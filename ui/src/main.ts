@@ -1,13 +1,16 @@
 import { createApp } from "vue";
 import { createPinia } from "pinia";
-import { createRouter, createWebHistory } from "vue-router";
+import { createRouter, createWebHistory, createWebHashHistory } from "vue-router";
 import App from "./App.vue";
 import LoginView from "./views/LoginView.vue";
 import ChatView from "./views/ChatView.vue";
 import "./assets/style.css";
 
+// Electron(file://)에서는 hash 모드, 웹에서는 history 모드
+const isElectron = window.location.protocol === "file:" || !!(window as any).electronAPI;
+
 const router = createRouter({
-  history: createWebHistory(),
+  history: isElectron ? createWebHashHistory() : createWebHistory(),
   routes: [
     { path: "/login", component: LoginView },
     { path: "/", component: ChatView },
